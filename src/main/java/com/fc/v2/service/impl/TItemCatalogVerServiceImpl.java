@@ -42,7 +42,8 @@ public class TItemCatalogVerServiceImpl implements ITItemCatalogVerService {
             return null;
         }
         int st = r.getStage() == null ? 0 : r.getStage();
-        r.setStage(Math.min(st + 2, MAX_STAGE));
+        // 推进一档就是一档：草拟→复核→付发布→已上柜，不许隔着档结案。
+        r.setStage(Math.min(st + 1, MAX_STAGE));
         r.setStatus(STATUS_ACTIVE);
         r.setLastAction(remark);
         this.itemCatalogVerMapper.updateById(r);
@@ -55,7 +56,9 @@ public class TItemCatalogVerServiceImpl implements ITItemCatalogVerService {
         if (r == null) {
             return null;
         }
-        r.setStage(0);
+        int st = r.getStage() == null ? 0 : r.getStage();
+        // 回退与推进同一把尺：一次也只挪一档，不一竿子打回草拟。
+        r.setStage(Math.max(st - 1, 0));
         r.setStatus(STATUS_ACTIVE);
         r.setLastAction(remark);
         this.itemCatalogVerMapper.updateById(r);

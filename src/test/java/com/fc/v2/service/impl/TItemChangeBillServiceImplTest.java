@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -15,12 +16,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper;
 import com.fc.v2.mapper.auto.TItemCatalogRowMapper;
 import com.fc.v2.mapper.auto.TItemChangeBillMapper;
 import com.fc.v2.mapper.auto.TItemChangeBillSignMapper;
@@ -55,6 +59,13 @@ class TItemChangeBillServiceImplTest {
 
     @InjectMocks
     private TItemChangeBillServiceImpl service;
+
+    @BeforeEach
+    void stubGuardedSave() {
+        // 带闸落库：mock 默认报 0 行，这里统一报 1 行落成；
+        // 验"扑空"的用例自行改报 0。
+        lenient().when(itemChangeBillMapper.update(any(), any())).thenReturn(1);
+    }
 
     // ---------- 县核：收材料、前置检 ----------
 
@@ -323,6 +334,123 @@ class TItemChangeBillServiceImplTest {
         ChangeBillTraceVo vo = service.verifyTrace(BILL_ID);
         assertFalse(vo.isPass());
         assertTrue(vo.getProblems().stream().anyMatch(p -> p.contains("落章")));
+    }
+
+    // ---------- 闸门同源：已删的件、抢手的件 ----------
+
+    @Test
+    void deletedBill_noEntryTouchesIt() {
+        // 已删的件：档上不存在，签、否、撤、打回一律不给动。
+        TItemChangeBill deleted = runningBill(1, 1);
+        deleted.setDelFlag(1);
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(deleted);
+
+        assertNull(service.approve(BILL_ID, "市员甲", "接着签"));
+        assertNull(service.reject(BILL_ID, "市员甲", "接着否"));
+        assertNull(service.withdraw(BILL_ID, "承办人"));
+
+        TItemChangeBill deletedAtProvince = runningBill(2, 1);
+        deletedAtProvince.setDelFlag(1);
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(deletedAtProvince);
+        assertNull(service.rollback(BILL_ID, "接着打回"));
+        verify(itemChangeBillSignMapper, never()).insert(any());
+    }
+
+    @Test
+    void approve_lostRaceToConcurrentVeto_returnsNullAndLeavesNoTrace() {
+        // 读罢被人抢先（否决/打回/落章）：带闸落库扑空，这一笔连同签迹一起不算数，
+        // 两边只认一个结果——已经否决的单子不能再接着签批。
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(0, 1));
+        when(itemChangeBillSignMapper.selectList(any())).thenReturn(new ArrayList<>());
+        when(itemChangeBillSignMapper.selectCount(any())).thenReturn(1);
+        when(itemChangeBillMapper.update(any(), any())).thenReturn(0);
+
+        assertNull(service.approve(BILL_ID, "县员甲", "县核收讫"));
+    }
+
+    @Test
+    void rollback_lostRaceToConcurrentSeal_returnsNull() {
+        // 打回与落章撞个满怀：落章先到的，打回这一下扑空，两边不各说各话。
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(2, 1));
+        when(itemChangeBillMapper.update(any(), any())).thenReturn(0);
+
+        assertNull(service.rollback(BILL_ID, "表述不合规矩"));
+    }
+
+    // ---------- 否决与签批同一个规矩 ----------
+
+    @Test
+    void reject_samePersonAlreadySignedAtNode_doesNotCount() {
+        // 关口两头一起看：亲笔者落过"通过"的口，同一人不能再补一笔"不予通过"。
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(2, 1));
+        when(itemChangeBillSignMapper.selectList(any()))
+                .thenReturn(Collections.singletonList(sign("省员甲", 1)));
+
+        assertNull(service.reject(BILL_ID, "省员甲", "自己否自己"));
+        verify(itemChangeBillSignMapper, never()).insert(any());
+    }
+
+    @Test
+    void reject_alsoCountsAsSigned_voteCountFollows() {
+        // 否决票也是落名：本口已落名数跟着签迹走，不停在原地。
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(1, 1));
+        when(itemChangeBillSignMapper.selectList(any())).thenReturn(new ArrayList<>());
+        when(itemChangeBillSignMapper.selectCount(any())).thenReturn(1);
+
+        TItemChangeBill r = service.reject(BILL_ID, "市员甲", "不予通过");
+        assertEquals(2, r.getStatus().intValue());
+        assertEquals(1, r.getSignCount().intValue(), "否决票落了名，票数跟着签迹走");
+    }
+
+    @Test
+    void approve_quorumCountsPassOnly_rejectTicketDoesNotFillProvince() {
+        // 历史件：省定口沉着一笔未清的不予通过签迹，齐签不拿否决票凑数。
+        TItemChangeBillSign oldVeto = sign("省员甲", null);
+        oldVeto.setVerdict(0);
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(2, 1));
+        when(itemChangeBillSignMapper.selectList(any()))
+                .thenReturn(Collections.singletonList(oldVeto));
+        when(itemChangeBillSignMapper.selectCount(any())).thenReturn(1);
+
+        TItemChangeBill r = service.approve(BILL_ID, "省员乙", "要素齐", 1);
+        assertNotNull(r);
+        assertEquals(2, r.getNodeNo().intValue());
+        assertEquals(0, r.getStatus().intValue(), "否决票不凑齐签，件仍卡省定见不着结案");
+    }
+
+    // ---------- 打回：沉底收干净、不涂旧签注 ----------
+
+    @Test
+    void rollback_sinksOldNamesWithoutRewritingTheirComments() {
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(runningBill(2, 3));
+
+        TItemChangeBill r = service.rollback(BILL_ID, "表述不合规矩");
+        assertNotNull(r);
+        assertEquals(4, r.getRoundNo().intValue());
+        assertEquals("表述不合规矩", r.getRemark(), "打回的说法记在单上");
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<UpdateWrapper<TItemChangeBillSign>> captor = ArgumentCaptor.forClass(UpdateWrapper.class);
+        verify(itemChangeBillSignMapper).update(any(), captor.capture());
+        String setClause = captor.getValue().getSqlSet();
+        assertTrue(setClause.contains("del_flag"), "沉底只摘牌");
+        assertFalse(setClause.contains("comment_text"), "沉底不涂旧签注，留给审计对照");
+    }
+
+    // ---------- 历史件兼容：情形栏是空的按在核办 ----------
+
+    @Test
+    void legacyBill_nullStatusAndNullLocked_stillFlows() {
+        TItemChangeBill legacy = runningBill(0, 1);
+        legacy.setStatus(null);
+        legacy.setLocked(null);
+        when(itemChangeBillMapper.selectById(BILL_ID)).thenReturn(legacy);
+        when(itemChangeBillSignMapper.selectList(any())).thenReturn(new ArrayList<>());
+        when(itemChangeBillSignMapper.selectCount(any())).thenReturn(1);
+
+        TItemChangeBill r = service.approve(BILL_ID, "县员甲", "县核收讫");
+        assertNotNull(r);
+        assertEquals(1, r.getNodeNo().intValue(), "历史件情形栏空着也按在核办，能签能走");
     }
 
     // ---------- helpers ----------

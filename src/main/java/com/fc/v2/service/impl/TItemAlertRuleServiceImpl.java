@@ -83,7 +83,10 @@ public class TItemAlertRuleServiceImpl implements ITItemAlertRuleService {
         if (avail.isEmpty()) {
             return 0;
         }
-        return levelOf(avail.get(0), input);
+        // 让线顺位全类只此一份：数值大的先说话，并列按代号定先后。
+        List<TItemAlertRule> ordered = new java.util.ArrayList<TItemAlertRule>(avail);
+        ordered.sort(PRIORITY_THEN_CODE_DESC);
+        return levelOf(ordered.get(0), input);
     }
 
     @Override
