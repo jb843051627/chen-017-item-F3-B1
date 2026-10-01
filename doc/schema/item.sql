@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS t_item_change_bill (
   round_no int DEFAULT '1' COMMENT '重走轮次，首报为1，省定表述打回一次加一',
   sign_mode int DEFAULT NULL COMMENT '同口并签办法 0任一人 1两名点齐',
   need_count int DEFAULT NULL COMMENT '本口应落名数（由签迹点数得出）',
-  sign_count int DEFAULT NULL COMMENT '本口已落名数（只按签迹表同一回点数回填）',
+  sign_count int DEFAULT NULL COMMENT '本轮累计已落通过票数（只按签迹表同一回点数回填，过口不清零）',
   status int DEFAULT NULL COMMENT '报批情形 0在核 1已核讫 2已打回 3已撤回',
   public_sync int DEFAULT '0' COMMENT '对外名录同步 0未同步 1已随省定章同步',
   locked int DEFAULT '0' COMMENT '全单封存 0在办 1省定落章后锁住',

@@ -30,6 +30,12 @@ import com.fc.v2.util.StringUtils;
  * 1 市核——拿县里递上来的同省里那册对照册比着看，只认事项码；
  * 2 省定——两人并排落名（一盯要素、一盯合规），落章后要素落定、对外名录同步、全单锁住。
  *
+ * 规矩只有一份：一口该落几名、是任一人还是两名点齐，全由 {@link #needCountOf}、
+ * {@link #signModeOf} 交出，起件、签批、打回、复核四处都照这一份，不许各写各的。
+ * 落了几个名只顺着签迹表同一回点出来（{@link #activeSigns} 是唯一的点数口径），
+ * 屏上回填的 sign_count 不作数；两头（签批关口、倒数复核）由同一道 {@link #nodeSatisfied}
+ * 判定，一头松一头紧的事不再有。
+ *
  * @author fuce
  * @date 2026-09-14
  */
@@ -42,6 +48,9 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
     private static final int NODE_CITY = 1;
     /** 道次：省定落章 */
     private static final int NODE_PROVINCE = 2;
+
+    /** 道次总数，从头数到尾就这三关 */
+    private static final int NODE_TOTAL = 3;
 
     private static final String[] NODE_NAMES = {"县核", "市核", "省定"};
 
@@ -75,6 +84,20 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
 
     @javax.annotation.Resource
     private TItemCatalogRowMapper itemCatalogRowMapper;
+
+    // ----------------------------------------------------------------------
+    // 规矩单一出处：全链各处只准照这里问，不准自己再写一份。
+    // ----------------------------------------------------------------------
+
+    /** 本口应落几名通过票：县核、市核任一名；省定两名点齐。 */
+    private static int needCountOf(int node) {
+        return node == NODE_PROVINCE ? 2 : 1;
+    }
+
+    /** 本口并签办法：县核、市核任一人；省定两名点齐。 */
+    private static int signModeOf(int node) {
+        return node == NODE_PROVINCE ? MODE_AND : MODE_OR;
+    }
 
     @Override
     public TItemChangeBill selectTItemChangeBillById(Long id) {
@@ -127,9 +150,9 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
                 : bill.getItemCode() + "-R" + round + "-" + seqNo);
 
         bill.setNodeNo(NODE_COUNTY);
-        // 县核、市核任一人即可放行；省定两名点齐。
-        bill.setSignMode(MODE_OR);
-        bill.setNeedCount(1);
+        // 起在哪一口，就照那一口的规矩立 mode/need——规矩只问唯一出处。
+        bill.setSignMode(signModeOf(NODE_COUNTY));
+        bill.setNeedCount(needCountOf(NODE_COUNTY));
         bill.setSignCount(0);
         // 前置检没过，件起得来但停在县核，往后再齐也不往前挪。
         bill.setStatus(STATUS_RUNNING);
@@ -169,8 +192,14 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
             role = watchRole;
         }
 
+        // 本口本轮还作数的签迹只点这一回，后面的计数、关口都用它，不再各点一遍。
         List<TItemChangeBillSign> signs = activeSigns(id, node, round);
 
+        // 否决即刹链：本口已落下过不予通过的票，链子当场刹住，过后谁来都不能再签。
+        // 已否决的件 loadMutable 也会挡，这里再挡一道，是给历史上“没刹住”的旧单兜底。
+        if (containsVerdict(signs, VERDICT_REJECT)) {
+            return null;
+        }
         // 同一角色一人只落自己一笔；同人再点、掐同一分钟再点都不另算一笔。
         // 替人代落：落名人与先前亲笔者同一人，冒充另一角色的那一笔不作数。
         for (TItemChangeBillSign s : signs) {
@@ -200,34 +229,49 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
         sign.setDelFlag(0);
         this.itemChangeBillSignMapper.insert(sign);
 
-        // 落了几个名，不由页面给框，只顺着签迹同一回点数出来。
-        int signed = countActiveSigns(id, node, round);
-        bill.setSignCount(signed);
+        // 把这一轮三口的签迹一次摆齐（当前口用刚落的这笔接上已点到的签迹），计数、齐签判定都只认这一桌。
+        List<List<TItemChangeBillSign>> roundSigns = loadRoundSigns(id, round, node, signs, sign);
+
+        // 票随签走：本口本轮已落的通过票，顺着签迹点，屏上填的数不作数。
+        int passedHere = passCount(roundSigns.get(node));
+        // 票数跟着签批往上走，不在过口时清零——从头一关累计到当前关。
+        bill.setSignCount(roundPassCount(roundSigns));
 
         if (node == NODE_PROVINCE) {
-            bill.setSignMode(MODE_AND);
-            bill.setNeedCount(2);
+            bill.setSignMode(signModeOf(NODE_PROVINCE));
+            bill.setNeedCount(needCountOf(NODE_PROVINCE));
             // 只到一名，件仍卡在省定，见不着结案。
-            if (signed < 2) {
-                this.itemChangeBillMapper.updateById(bill);
+            if (passedHere < needCountOf(NODE_PROVINCE)) {
+                guardUpdate(bill, node, round);
                 return bill;
             }
-            // 两名点齐：省定落章，要素改动落定，对外名录同步，全单各栏一起锁住。
+            // 两名点齐还不算完：齐签是整条链的事，县核、市核的通过票也得都在档里。
+            // 历史上留下的要素调整核签单若缺了下头的票，这里不放行——新老单一道规矩。
+            if (!chainSatisfied(roundSigns)) {
+                guardUpdate(bill, node, round);
+                return bill;
+            }
+            // 整条链三口齐签：省定落章，要素改动落定，对外名录同步，全单各栏一起锁住。
             bill.setNodeNo(NODE_PROVINCE);
             bill.setStatus(STATUS_PASS);
             bill.setPublicSync(1);
             bill.setLocked(1);
             bill.setSealTime(new Date());
-            this.itemChangeBillMapper.updateById(bill);
+            guardUpdate(bill, node, round);
             return bill;
         }
 
-        // 县核、市核：一笔即过口，按口次往上递，催得急也不顶用，不能跳着落名。
-        bill.setNodeNo(node + 1);
-        bill.setSignMode(node + 1 == NODE_PROVINCE ? MODE_AND : MODE_OR);
-        bill.setNeedCount(node + 1 == NODE_PROVINCE ? 2 : 1);
-        bill.setSignCount(0);
-        this.itemChangeBillMapper.updateById(bill);
+        // 县核、市核：一口应落一名，点齐才过口，按口次往上递，催得急也不顶用，不能跳着落名。
+        if (passedHere < needCountOf(node)) {
+            guardUpdate(bill, node, round);
+            return bill;
+        }
+        int next = node + 1;
+        bill.setNodeNo(next);
+        bill.setSignMode(signModeOf(next));
+        bill.setNeedCount(needCountOf(next));
+        // sign_count 不清零：累计票数随件一起往上走。
+        guardUpdate(bill, node, round);
         return bill;
     }
 
@@ -241,12 +285,18 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
         int node = bill.getNodeNo() == null ? NODE_COUNTY : bill.getNodeNo();
         int round = bill.getRoundNo() == null ? 1 : bill.getRoundNo();
 
+        List<TItemChangeBillSign> signs = activeSigns(id, node, round);
+        // 已落过否决票的口，链子早刹住了，不另写一张“不予通过”。
+        if (containsVerdict(signs, VERDICT_REJECT)) {
+            return null;
+        }
+
         // 不予通过也得是本口亲笔者落下的结论。
         TItemChangeBillSign sign = new TItemChangeBillSign();
         sign.setBillId(id);
         sign.setNodeNo(node);
         sign.setRoundNo(round);
-        sign.setSeq(countActiveSigns(id, node, round) + 1);
+        sign.setSeq(signs.size() + 1);
         sign.setSigner(approver);
         sign.setWatchRole(node == NODE_PROVINCE ? ROLE_COMPLIANCE : null);
         sign.setVerdict(VERDICT_REJECT);
@@ -257,7 +307,8 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
 
         // 哪一口写下不予通过，这一件就此停在该口，往后既不追加也不改写。
         bill.setStatus(STATUS_VETO);
-        this.itemChangeBillMapper.updateById(bill);
+        // 否决票不计入通过票数。
+        guardUpdate(bill, node, round);
         return bill;
     }
 
@@ -269,15 +320,18 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
             return null;
         }
         // 已止步、已落章锁住的件，撤不动也改不动。
-        if (bill.getStatus() != null && bill.getStatus() != STATUS_RUNNING) {
+        if (bill.getStatus() == null || bill.getStatus() != STATUS_RUNNING) {
             return null;
         }
         if (Integer.valueOf(1).equals(bill.getLocked())) {
             return null;
         }
+        int node = bill.getNodeNo() == null ? NODE_COUNTY : bill.getNodeNo();
+        int round = bill.getRoundNo() == null ? 1 : bill.getRoundNo();
         // 承办人把件撤回报送，这一件就此止步。
         bill.setStatus(STATUS_WITHDRAWN);
-        this.itemChangeBillMapper.updateById(bill);
+        // 同样带旧口旧轮把关：半途若已被签批挪了口，这条撤回落 0 行，整笔回滚。
+        guardUpdate(bill, node, round);
         return bill;
     }
 
@@ -292,6 +346,15 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
             return null;
         }
         int round = r.getRoundNo() == null ? 1 : r.getRoundNo();
+        int nextRound = round + 1;
+
+        // 同一道规矩：这一轮任一口已落下过不予通过的票，链子既已刹住，就不许借“表述打回”沉底复活。
+        // 兼容历史旧单——哪怕 status 当年没置上，签迹里的否决票也算数。
+        for (int node = NODE_COUNTY; node <= NODE_PROVINCE; node++) {
+            if (containsVerdict(activeSigns(id, node, round), VERDICT_REJECT)) {
+                return null;
+            }
+        }
 
         // 先前各口落过的名目整批沉底：沉下去的那批与新补的那批不并排摆。
         this.itemChangeBillSignMapper.update(null, new UpdateWrapper<TItemChangeBillSign>()
@@ -302,16 +365,17 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
                 .set("comment_text", comment));
 
         // 从县核那一口重新一层层往上攒。
-        int nextRound = round + 1;
         r.setRoundNo(nextRound);
         r.setNodeNo(NODE_COUNTY);
-        r.setSignMode(MODE_OR);
-        r.setNeedCount(1);
+        r.setSignMode(signModeOf(NODE_COUNTY));
+        r.setNeedCount(needCountOf(NODE_COUNTY));
+        // 旧轮次的票整批沉了底，新一轮的票数从 0 重新攒——二次提交不会顶着旧票报满员。
         r.setSignCount(0);
         r.setStatus(STATUS_RUNNING);
         // 对外那一页跟着章走过一回，打回后旧记载不作数，待新一轮落章再同步。
         r.setPublicSync(0);
-        this.itemChangeBillMapper.updateById(r);
+        // 条件带旧口旧轮：半途若另有一笔签批/打回改了单，这条更新落 0 行，整笔回滚。
+        guardUpdate(r, NODE_PROVINCE, round);
         return r;
     }
 
@@ -340,36 +404,32 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
             vo.getProblems().add("省定尚未落章或对外名录未同步");
         }
 
-        // 从省定倒数回县核，每一口都经得起复核。
+        // 从省定倒数回县核，每一口都用与签批同一道判定复核。
         int archivedTotal = 0;
+        int publicTotal = 0;
         for (int node = NODE_PROVINCE; node >= NODE_COUNTY; node--) {
             List<TItemChangeBillSign> signs = activeSigns(id, node, round);
             List<String> names = new ArrayList<>();
             for (TItemChangeBillSign s : signs) {
                 names.add(s.getSigner());
             }
-            int need = node == NODE_PROVINCE ? 2 : 1;
-            int signed = signs.size();
+            int need = needCountOf(node);
+            int signed = passCount(signs);
             archivedTotal += signed;
+            publicTotal += need;
 
-            if (signed != need) {
+            // 齐不齐由 nodeSatisfied 一锤定音——签批放行看它，复核也看它，两头同源。
+            if (!nodeSatisfied(node, signs)) {
                 ok = false;
-                vo.getProblems().add(NODE_NAMES[node] + "应落" + need + "名，签迹只有" + signed + "名");
-            }
-            // 一笔不差：同一口里不许同人落两笔，省定两口角色须齐。
-            if (node == NODE_PROVINCE) {
-                boolean hasElement = false;
-                boolean hasCompliance = false;
-                for (TItemChangeBillSign s : signs) {
-                    if (Integer.valueOf(ROLE_ELEMENT).equals(s.getWatchRole())) {
-                        hasElement = true;
-                    }
-                    if (Integer.valueOf(ROLE_COMPLIANCE).equals(s.getWatchRole())) {
-                        hasCompliance = true;
-                    }
+                if (containsVerdict(signs, VERDICT_REJECT)) {
+                    vo.getProblems().add(NODE_NAMES[node] + "夹着不予通过的票，链子本应刹住");
+                } else if (signed != need) {
+                    vo.getProblems().add(NODE_NAMES[node] + "应落" + need + "名，签迹只有" + signed + "名");
                 }
-                if (!hasElement || !hasCompliance) {
-                    ok = false;
+                if (hasDuplicateSigner(signs)) {
+                    vo.getProblems().add(NODE_NAMES[node] + "同一落名人占了两笔，代签不作数");
+                }
+                if (node == NODE_PROVINCE && !provinceRolesComplete(signs)) {
                     vo.getProblems().add(NODE_NAMES[node] + "盯要素、盯合规两笔未点齐");
                 }
             }
@@ -377,8 +437,6 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
         }
 
         // 同一回点数：报给外头看的几名与档里存下的几名由这一回交出，两头合不拢便算没齐。
-        // 对外口径 = 县核1 + 市核1 + 省定2。
-        int publicTotal = 1 + 1 + 2;
         vo.setArchivedCount(archivedTotal);
         vo.setPublicCount(publicTotal);
         if (archivedTotal != publicTotal) {
@@ -392,6 +450,7 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
 
     /**
      * 取出还能落笔的单据：不存在、已止步、已封单，一律不给签、不给退。
+     * approve 与 reject 共用这道关口，两头规矩同一个，不会一头放、一头拦。
      */
     private TItemChangeBill loadMutable(Long id, String approver) {
         if (id == null || StringUtils.isEmpty(approver)) {
@@ -402,7 +461,7 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
             return null;
         }
         // 不予通过、撤回的件就此停住；省定落章后全单锁住，再动须另开一张单。
-        if (bill.getStatus() != null && bill.getStatus() != STATUS_RUNNING) {
+        if (bill.getStatus() == null || bill.getStatus() != STATUS_RUNNING) {
             return null;
         }
         if (Integer.valueOf(1).equals(bill.getLocked())) {
@@ -412,7 +471,8 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
     }
 
     /**
-     * 本口本轮还作数的签迹，按落名先后排下。
+     * 本口本轮还作数的签迹，按落名先后排下。全链“落了几笔”只认这一个口径，
+     * 绝不在另一处再 selectCount 点一遍——并发叠上回滚时两处才不会点出两样。
      */
     private List<TItemChangeBillSign> activeSigns(Long billId, int node, int round) {
         return this.itemChangeBillSignMapper.selectList(new QueryWrapper<TItemChangeBillSign>()
@@ -423,13 +483,131 @@ public class TItemChangeBillServiceImpl implements ITItemChangeBillService {
                 .orderByAsc("seq"));
     }
 
-    private int countActiveSigns(Long billId, int node, int round) {
-        Integer c = this.itemChangeBillSignMapper.selectCount(new QueryWrapper<TItemChangeBillSign>()
-                .eq("bill_id", billId)
-                .eq("node_no", node)
-                .eq("round_no", round)
-                .eq("del_flag", 0));
-        return c == null ? 0 : c;
+    /**
+     * 把这一轮三口的作数签迹一次取齐。当前口直接用落笔前点到的那一摞接上刚落的这笔，
+     * 不再回库重点——一笔签批内对签迹只有这一回读，并发叠回滚时点不出两样。
+     */
+    private List<List<TItemChangeBillSign>> loadRoundSigns(Long billId, int round, int currentNode,
+            List<TItemChangeBillSign> currentSigns, TItemChangeBillSign justSigned) {
+        List<List<TItemChangeBillSign>> all = new ArrayList<>(NODE_TOTAL);
+        for (int node = NODE_COUNTY; node <= NODE_PROVINCE; node++) {
+            if (node == currentNode) {
+                List<TItemChangeBillSign> here = new ArrayList<>(currentSigns);
+                here.add(justSigned);
+                all.add(here);
+            } else {
+                all.add(activeSigns(billId, node, round));
+            }
+        }
+        return all;
+    }
+
+    private static boolean containsVerdict(List<TItemChangeBillSign> signs, int verdict) {
+        for (TItemChangeBillSign s : signs) {
+            if (Integer.valueOf(verdict).equals(s.getVerdict())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 一摞签迹里通过票的笔数（不予通过、沉底的都不算）。 */
+    private static int passCount(List<TItemChangeBillSign> signs) {
+        int n = 0;
+        for (TItemChangeBillSign s : signs) {
+            if (Integer.valueOf(VERDICT_PASS).equals(s.getVerdict())) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    private static int roundPassCount(List<List<TItemChangeBillSign>> roundSigns) {
+        int total = 0;
+        for (List<TItemChangeBillSign> signs : roundSigns) {
+            total += passCount(signs);
+        }
+        return total;
+    }
+
+    /** 省定两口角色是否点齐：一盯要素、一盯合规，各一笔。 */
+    private static boolean provinceRolesComplete(List<TItemChangeBillSign> signs) {
+        boolean hasElement = false;
+        boolean hasCompliance = false;
+        for (TItemChangeBillSign s : signs) {
+            if (Integer.valueOf(ROLE_ELEMENT).equals(s.getWatchRole())) {
+                hasElement = true;
+            }
+            if (Integer.valueOf(ROLE_COMPLIANCE).equals(s.getWatchRole())) {
+                hasCompliance = true;
+            }
+        }
+        return hasElement && hasCompliance;
+    }
+
+    /** 同一口里同一落名人是否占了两笔（代签、重复点）。 */
+    private static boolean hasDuplicateSigner(List<TItemChangeBillSign> signs) {
+        List<String> seen = new ArrayList<>();
+        for (TItemChangeBillSign s : signs) {
+            if (s.getSigner() != null && seen.contains(s.getSigner())) {
+                return true;
+            }
+            seen.add(s.getSigner());
+        }
+        return false;
+    }
+
+    /**
+     * 一道关口的唯一判定：本口这摞签迹算不算“齐签通过”。
+     * 签批放行、倒数复核两头都只问它——应落几名照 {@link #needCountOf}，
+     * 不许夹否决票、不许同人占两笔，省定还须两角色点齐。
+     */
+    private static boolean nodeSatisfied(int node, List<TItemChangeBillSign> signs) {
+        if (containsVerdict(signs, VERDICT_REJECT)) {
+            return false;
+        }
+        if (passCount(signs) != needCountOf(node)) {
+            return false;
+        }
+        if (hasDuplicateSigner(signs)) {
+            return false;
+        }
+        if (node == NODE_PROVINCE && !provinceRolesComplete(signs)) {
+            return false;
+        }
+        return true;
+    }
+
+    /** 整条链三口是否都齐签——省定落章前的最后一道，缺哪一关的票都不落章。 */
+    private static boolean chainSatisfied(List<List<TItemChangeBillSign>> roundSigns) {
+        for (int node = NODE_COUNTY; node <= NODE_PROVINCE; node++) {
+            if (!nodeSatisfied(node, roundSigns.get(node))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 带关口条件落库：只在单据仍停在“旧口、旧轮、在核、未锁”时更新才作数。
+     * 并发叠上回滚/另一笔签批时，必有一处更新落 0 行——随即抛错整笔回滚，
+     * 两处不会各执一套结果。
+     */
+    private void guardUpdate(TItemChangeBill bill, Integer expectNode, Integer expectRound) {
+        UpdateWrapper<TItemChangeBill> uw = new UpdateWrapper<TItemChangeBill>()
+                .eq("id", bill.getId())
+                .eq("status", STATUS_RUNNING)
+                .eq("locked", 0);
+        if (expectNode != null) {
+            uw.eq("node_no", expectNode.intValue());
+        }
+        if (expectRound != null) {
+            uw.eq("round_no", expectRound.intValue());
+        }
+        int rows = this.itemChangeBillMapper.update(bill, uw);
+        if (rows != 1) {
+            throw new IllegalStateException("单据已被另一笔签批或打回改动，请重新过目后再办");
+        }
     }
 
     /**

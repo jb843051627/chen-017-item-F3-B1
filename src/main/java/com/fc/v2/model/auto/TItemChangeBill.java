@@ -97,9 +97,9 @@ public class TItemChangeBill implements Serializable {
     @ApiModelProperty(value = "本口应落名数")
     private Integer needCount;
 
-    /** 本口已落名数（只按签迹表同一回点数回填，屏上填的不作数） */
+    /** 本轮从头一关累计的已落通过票数（只按签迹表同一回点数回填，过口不清零，屏上填的不作数） */
     @TableField("sign_count")
-    @ApiModelProperty(value = "本口已落名数")
+    @ApiModelProperty(value = "本轮累计已落通过票数")
     private Integer signCount;
 
     /** 报批情形 0在核 1已核讫 2已打回(止步) 3已撤回(止步) */
